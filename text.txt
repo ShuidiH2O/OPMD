@@ -1,0 +1,862 @@
+# ============================================================
+# OPMD 三臂训练命令（新环境 opmd_train_cu12）
+# 环境: vllm 0.19.1 + torch 2.10.0+cu128 (CUDA 12.8) + driver 570
+# 教师模型: qwen3-14b-base（默认）
+# ============================================================
+
+# ---------- 激活环境 ----------
+conda activate opmd_train_cu12
+
+# ---------- 低熵臂 ----------
+TRAIN_DATASET=/mnt/cpfs/epic-user/zhengruize-20260612/OPMD/datasets/megamath_web_pro_opmd_low_0.05_train.parquet \
+TRAIN_DATASET_NAME=MegaMath-Web-Pro-OPMD-low-0.05 \
+bash /mnt/cpfs/epic-user/zhengruize-20260612/OPMD/opmd_train.sh
+
+# ---------- 随机臂 ----------
+TRAIN_DATASET=/mnt/cpfs/epic-user/zhengruize-20260612/OPMD/datasets/megamath_web_pro_opmd_rand_0.05_train.parquet \
+TRAIN_DATASET_NAME=MegaMath-Web-Pro-OPMD-rand-0.05 \
+bash /mnt/cpfs/epic-user/zhengruize-20260612/OPMD/opmd_train.sh
+
+# ---------- 高熵臂 ----------
+# 注意：高熵臂之前用旧环境（vllm 0.23.0）训过；
+# 三臂要严格对齐的话建议用新环境重跑，若接受 rollout 的 vllm 版本差异可跳过。
+TRAIN_DATASET=/mnt/cpfs/epic-user/zhengruize-20260612/OPMD/datasets/megamath_web_pro_opmd_0.05_train.parquet \
+TRAIN_DATASET_NAME=MegaMath-Web-Pro-OPMD-0.05 \
+bash /mnt/cpfs/epic-user/zhengruize-20260612/OPMD/opmd_train.sh
+
+# ============================================================
+# 说明：
+# - 三臂仅 TRAIN_DATASET / TRAIN_DATASET_NAME 不同，其余超参一致：
+#   teacher=qwen3-14b-base, mbs=64, topk=16/only_stu/rw=teacher_p,
+#   LR=1e-6, KL=True。
+# - checkpoint 目录由 TRAIN_DATASET_NAME 区分，不会互相覆盖。
+# - 单臂约数小时，建议走 Slurm 或后台运行。
+# ============================================================
+# ============================================================
+# OPMD rand 臂 Qwen3-1.7B-Base checkpoint 评测命令（环境 opmd_eval_cu12）
+# 脚本位置: OPMD/scripts/eval/eval_qwen3_1.7b_opmd.sh
+# 已修改：conda 环境 opmd -> opmd_eval_cu12；checkpoint 指向 rand 臂；输出目录独立
+# ============================================================
+
+# 激活评测环境
+conda activate opmd_eval_cu12
+
+# 1. 评测默认 step 1132（rand 臂最新 checkpoint）
+bash /mnt/cpfs/epic-user/zhengruize-20260612/OPMD/scripts/eval/eval_qwen3_1.7b_opmd.sh
+
+# 2. 评测指定 step
+EVAL_STEP=1000 bash /mnt/cpfs/epic-user/zhengruize-20260612/OPMD/scripts/eval/eval_qwen3_1.7b_opmd.sh
+
+# 3. 跳过合并（模型已合并过时使用）
+SKIP_MERGE=1 EVAL_STEP=1132 bash /mnt/cpfs/epic-user/zhengruize-20260612/OPMD/scripts/eval/eval_qwen3_1.7b_opmd.sh# ============================================================
+
+
+
+# 网络不稳定 / SSH 断线时如何让训练继续跑
+# ============================================================
+
+# ---------- 推荐：tmux（重连后仍能实时看进度条） ----------
+which tmux                 # 确认是否有 tmux；没有则用下面的 nohup
+
+tmux new -s opmd_low       # 新建 session
+
+# 进入 tmux 后，在里面启动训练（按上面三臂命令即可，例如低熵臂）：
+conda activate opmd_train_cu12
+cd /mnt/cpfs/epic-user/zhengruize-20260612
+ARM=low bash OPMD/opmd_train.sh
+
+# 断开 SSH 前先“脱离”会话（不是关闭）：按下 Ctrl+b 然后按 d
+# 看到 [detached] 后，直接关 SSH 窗口也没事，训练继续在服务器上跑。
+
+tmux attach -t opmd_low        # 重连后挂回会话，实时看进度
+tmux ls                        # 查看所有 session
+tmux kill-session -t opmd_low  # 训练结束后删除 session
+
+# ---------- 备选：nohup + 后台（没有 tmux 时） ----------
+conda activate opmd_train_cu12
+cd /mnt/cpfs/epic-user/zhengruize-20260612
+nohup env ARM=low bash OPMD/opmd_train.sh > opmd_low_nohup.log 2>&1 &
+disown
+
+tail -f OPMD/logs/opmd_*.log   # 事后看日志（nohup 没有实时交互界面）
+
+# ---------- 如果训练已在前台运行 ----------
+# 推荐：Ctrl+C 终止，再用 RESUME_CKPT 在 tmux 里断点续传（损失很小）：
+#   RESUME_CKPT=<checkpoint_dir> ARM=low bash OPMD/opmd_train.sh
+# 不建议用 reptyr 硬“搬”进程，容易踩坑。
+
+# 说明：ARM=low 等价于上面 TRAIN_DATASET/TRAIN_DATASET_NAME 的 low 写法，
+#      是 opmd_train.sh 新增的快捷开关（high/low/rand）。
+
+
+# ============================================================
+# OPMD low 臂断点续传指令（租约中断后，从 step 600 继续）
+# ============================================================
+
+# ---------- 结论 ----------
+# 脚本支持断点续传：RESUME_CKPT=<checkpoint_dir>
+# verl 默认 resume_mode=auto，default_local_dir 指向已有 checkpoint 目录时，
+# 自动从最新 global_step_* 续传。
+# low 臂最新 checkpoint 目录：
+CKPT=/mnt/cpfs/epic-user/zhengruize-20260612/OPMD/checkpoints/opmd_MegaMath-Web-Pro-OPMD-low-0.05_Qwen3-1.7B-Base_qwen3-14b-base_512-T_1.0-n_1-mbs_64-topk_16-only_stu-rw_teacher_p-2026-08-28_01-03-02
+
+# 其中 latest_checkpointed_iteration.txt 的内容为 600，因此从 step 600 继续。
+# 日志实际已跑到 step 637，但 save_freq=100，601-637 未保存，续传后会重跑约 37 步（约 80 分钟），正常。
+
+# ---------- 操作步骤 ----------
+# 1) 新建 tmux session（在拿到 GPU 分配的 shell 里启动）
+tmux new -s opmd_low_resume
+
+# 2) 在 tmux 里激活环境并进入项目根目录
+conda activate opmd_train_cu12
+cd /mnt/cpfs/epic-user/zhengruize-20260612
+
+# 3) 用 RESUME_CKPT 续传（沿用 ARM=low）
+RESUME_CKPT="$CKPT" ARM=low bash OPMD/opmd_train.sh
+
+# 4) 确认是续传而非从头训练，日志应出现：
+#    Load from checkpoint folder: .../global_step_600
+#    Setting global step to 600
+#    Resuming from .../global_step_600
+#    未出现则说明路径有误，Ctrl-c 停下检查。
+
+# 5) 脱离 tmux：先按 Ctrl-b，松开后按 d
+tmux attach -t opmd_low_resume       # 重新进入
+tmux ls                              # 查看所有 session
+tmux kill-session -t opmd_low_resume # 确认要停止时才用
+
+
+
+
+
+# ---------- 提醒 ----------
+# - 必须在 GPU 分配好的 shell（CUDA_VISIBLE_DEVICES 被设成 UUID）里启动；
+#   脚本会自动把 UUID 转成 vLLM 的数字索引，裸 shell 会退回用 nvidia-smi 的全部 GPU。
+# - 脚本每次会自动 ray stop --force 并清理 /var/tmp/ray_*，无需手动清理。
+# - 续传后会生成新日志 OPMD/logs/opmd_*.log，可 tail 查看进度。# ============================================================
+# OPMD high/random 双臂 × step 200/400/600/800/1000 评测命令
+# 脚本: OPMD/scripts/eval/eval_qwen3_1.7b_opmd.sh（已改为双臂扫描）
+# 环境: opmd_eval_cu12；每个 (臂, step) 跑 MATH-500 + Minerva
+# ============================================================
+
+# 激活评测环境
+conda activate opmd_eval_cu12
+
+# 1) 全量：high + random 两臂 × step 200/400/600/800/1000（共 10 组）
+bash /mnt/cpfs/epic-user/zhengruize-20260612/OPMD/scripts/eval/eval_qwen3_1.7b_opmd.sh
+
+# 2) 只跑部分 step
+EVAL_STEPS=200,400 bash /mnt/cpfs/epic-user/zhengruize-20260612/OPMD/scripts/eval/eval_qwen3_1.7b_opmd.sh
+
+# 3) 显式锁 4 卡（默认 auto 自动从 CUDA_VISIBLE_DEVICES 选合法 TP）
+GPU_IDS=0,1,2,3 bash /mnt/cpfs/epic-user/zhengruize-20260612/OPMD/scripts/eval/eval_qwen3_1.7b_opmd.sh
+
+# 4) 已合并过时跳过合并（断点续跑，避免重复跑已生成 step）
+SKIP_MERGE=1 bash /mnt/cpfs/epic-user/zhengruize-20260612/OPMD/scripts/eval/eval_qwen3_1.7b_opmd.sh
+
+# Slurm 交互式运行（在 GPU 分配好的 shell 里）
+srun -p TEST1 -N 1 --gres=gpu:4 --cpus-per-task=32 --time=16:00:00 \
+  bash /mnt/cpfs/epic-user/zhengruize-20260612/OPMD/scripts/eval/eval_qwen3_1.7b_opmd.sh
+
+# 输出结果（每个 step 一份 grading_summary.json，含 pass@1 / avg@k）：
+#   高熵臂: OPMD/eval_results/opmd_qwen3_1.7b_megamath_14b_teacher/step_{step}_math500_minerva/grading_summary.json
+#   随机臂: OPMD/eval_results/opmd_qwen3_1.7b_megamath_14b_teacher_rand/step_{step}_math500_minerva/grading_summary.json# ============================================================
+# 用 tmux 防止评测断连（/tmp 已满，必须把 tmux socket 放到 /dev/shm）
+# ============================================================
+
+# ---- 0. 先把当前前台评测 Ctrl+C 停掉（若还在前台跑） ----
+
+# ---- 1. 固定 tmux socket 目录（重连后必须用同一个） ----
+export TMUX_TMPDIR=/dev/shm/zhengruize-20260612/tmux
+mkdir -p "$TMUX_TMPDIR"
+
+# ---- 2. 建 session 并在里面启动评测 ----
+tmux new -s opmd_eval
+# 进入 tmux 后依次执行：
+#   conda activate opmd_eval_cu12
+#   cd /mnt/cpfs/epic-user/zhengruize-20260612
+#   SKIP_MERGE=1 bash OPMD/scripts/eval/eval_qwen3_1.7b_opmd.sh
+# 然后按 Ctrl+b 再按 d 脱离（看到 [detached] 即可安全关 SSH）
+
+# ---- 3. 断线重连后挂回 ----
+export TMUX_TMPDIR=/dev/shm/zhengruize-20260612/tmux
+tmux attach -t opmd_eval
+
+# ---- 其它 ----
+tmux ls                          # 查看所有 session
+tmux kill-session -t opmd_eval   # 确认要停止时才用
+
+
+
+
+# 注意：重连时必须先 export 同一个 TMUX_TMPDIR 再 attach，
+# 否则 tmux 会去 /tmp 找 socket 而失败（/tmp 空间不足）。# ============================================================
+# 第 1 步：评测教师模型 qwen3-14b-base（MATH-500 + Minerva）
+# 脚本: OPMD/scripts/eval/eval_qwen3_14b_teacher.sh（直接加载 HF 模型，无需合并）
+# 输出: OPMD/eval_results/qwen3_14b_base_teacher/
+# 注意 Qwen3-14B 有 40 heads，TP 必须整除 40，推荐 4 卡 (TP=4)
+# ============================================================
+
+# 激活环境
+conda activate opmd_eval_cu12
+
+# 全量（MATH-500 + Minerva，16 rollouts）
+bash /mnt/cpfs/epic-user/zhengruize-20260612/OPMD/scripts/eval/eval_qwen3_14b_teacher.sh
+
+# 显式锁 4 卡
+GPU_IDS=0,1,2,3 bash /mnt/cpfs/epic-user/zhengruize-20260612/OPMD/scripts/eval/eval_qwen3_14b_teacher.sh
+
+# Slurm 交互式
+srun -p TEST1 -N 1 --gres=gpu:4 --cpus-per-task=32 --time=06:00:00 \
+  bash /mnt/cpfs/epic-user/zhengruize-20260612/OPMD/scripts/eval/eval_qwen3_14b_teacher.sh
+
+# ============================================================
+# 第 2 步：评测 low 臂 step 300/600/900/1200/1500（MATH-500 + Minerva）
+# 脚本: OPMD/scripts/eval/eval_qwen3_1.7b_opmd.sh（已改为默认 low 臂）
+# 输出: OPMD/eval_results/opmd_qwen3_1.7b_megamath_14b_teacher_low/step_{step}_math500_minerva/
+# ============================================================
+
+# 全量（low 臂 × 5 step，共 5 组）
+bash /mnt/cpfs/epic-user/zhengruize-20260612/OPMD/scripts/eval/eval_qwen3_1.7b_opmd.sh
+
+# 只跑部分 step
+EVAL_STEPS=300,600 bash /mnt/cpfs/epic-user/zhengruize-20260612/OPMD/scripts/eval/eval_qwen3_1.7b_opmd.sh
+
+# 显式锁 4 卡
+GPU_IDS=0,1,2,3 bash /mnt/cpfs/epic-user/zhengruize-20260612/OPMD/scripts/eval/eval_qwen3_1.7b_opmd.sh
+
+# 已合并过时跳过合并（断点续跑）
+SKIP_MERGE=1 bash /mnt/cpfs/epic-user/zhengruize-20260612/OPMD/scripts/eval/eval_qwen3_1.7b_opmd.sh
+
+# Slurm 交互式
+srun -p TEST1 -N 1 --gres=gpu:4 --cpus-per-task=32 --time=12:00:00 \
+  bash /mnt/cpfs/epic-user/zhengruize-20260612/OPMD/scripts/eval/eval_qwen3_1.7b_opmd.sh
+  
+  
+  
+  
+  
+# ============================================================
+# NTP 训练（Qwen3-1.7B-Base, MegaMath-Web-Pro 1B）—— 新版保存策略
+# 脚本: NTP/submit_ntp_qwen3_1.7b_megamath.sh（已修改）
+# 改动: SAVE_STEPS=400  +  save_total_limit=-1（保留全部 checkpoint）
+# 预期保存: step 400 / 800 / 1200 / 1600（以及最终 ~1900）
+# ============================================================
+
+# 方式 1：Slurm 提交（脚本自带 #SBATCH 头，8 卡）
+sbatch /mnt/cpfs/epic-user/zhengruize-20260612/NTP/submit_ntp_qwen3_1.7b_megamath.sh
+
+# 方式 2：交互式 / tmux 内直接跑（在已分配 GPU 的 shell）
+bash /mnt/cpfs/epic-user/zhengruize-20260612/NTP/submit_ntp_qwen3_1.7b_megamath.sh
+
+# 如需覆盖参数再跑（例如显式 4 卡、不同 lr）
+LEARNING_RATE=1e-5 bash /mnt/cpfs/epic-user/zhengruize-20260612/NTP/submit_ntp_qwen3_1.7b_megamath.sh# ============================================================
+# NTP Qwen3-1.7B-Base — StarCoderData (coding) 训练命令
+# 环境: opmd（deepspeed 0.19.2 + transformers 4.57.6）
+# 脚本: NTP/submit_ntp_qwen3_1.7b_StarCoderData.sh
+# ============================================================
+
+# ---------- 激活环境并进入目录 ----------
+conda activate opmd
+cd /mnt/cpfs/epic-user/zhengruize-20260612/NTP
+
+# ---------- 第 1 步：预处理 coding 1B JSON -> 8192 token 块 (arrow) ----------
+# 关键：datasets.map(num_proc) 会用 multiprocessing.Manager() 在 $TMPDIR(默认 /tmp) 建临时 socket，
+# /tmp 空间小会启动失败导致 EOFError，必须先切到 /dev/shm。
+export TMPDIR=/dev/shm/zhengruize-20260612/tmp
+mkdir -p "$TMPDIR"
+export TOKENIZERS_PARALLELISM=false
+
+# 清掉上次不完整输出（如有）
+rm -rf processed_data/StarCoderData_1B_qwen3_1.7b
+
+python preprocess_data.py \
+    --model_name_or_path /mnt/cpfs/epic-user/zhengruize-20260612/OPMD_models/Qwen3-1.7B-Base \
+    --data_path /mnt/cpfs/epic-user/zhengruize-20260612/OPMD/datasets/coding_1b/train.jsonl \
+    --output_dir processed_data/StarCoderData_1B_qwen3_1.7b \
+    --max_seq_length 8192 \
+    --preprocessing_num_workers 4 \
+    --overwrite_cache
+
+# ---------- 第 2 步：启动训练 ----------
+# 直接跑（已在 GPU 节点上）
+bash submit_ntp_qwen3_1.7b_StarCoderData.sh
+
+# 或用 Slurm 提交
+sbatch submit_ntp_qwen3_1.7b_StarCoderData.sh
+
+# ---------- 续训（从已有 checkpoint 恢复） ----------
+OUTPUT_DIR=checkpoints/<已有目录名> bash submit_ntp_qwen3_1.7b_StarCoderData.sh
+
+# ============================================================
+# 说明：
+# - 超参：seq 8192 / per-device-bs 2 / grad-accum 8 / lr 1e-5 /
+#   cosine / warmup 0.03 / weight-decay 0.01 / bf16 / 1 epoch /
+#   DeepSpeed ZeRO-2。与 MegaMath NTP baseline 完全同参对照。
+# - 总 batch = 2 * 8 * GPU数：4 GPU -> bs 64（约 1900 步）；
+#   8 GPU -> bs 128（约 950 步）。
+# - checkpoint 每 400 步保存，目录：
+#   NTP/checkpoints/ntp_qwen3_1.7b_StarCoderData_8192ctx_lr1e-5_bs<B>_steps-1_<时间戳>/
+# - 预处理会加载 4GB JSON，需较大内存；OOM 时把 --preprocessing_num_workers 降到 4。
+# - 日志：直接跑 -> NTP/logs/run_<时间戳>.log；sbatch -> logs/output_%j.log。
+# - 时间参考：MegaMath 1B / 8xA800 约 10h+，约 36s/步；coding 1B 规模接近。
+# ============================================================
+
+
+
+
+
+# ============================================================
+# Coding benchmark 评测（base + NTP checkpoint）
+# HumanEval+ / MBPP+ / LiveCodeBench
+# 生成环境: opmd_eval_cu12 (vllm 0.19.1)
+# 评分环境: opmd (含 evalplus)
+# ============================================================
+
+# ---------- 固定路径 ----------
+CKPT_ROOT=/mnt/cpfs/epic-user/zhengruize-20260612/NTP/checkpoints/ntp_qwen3_1.7b_StarCoderData_8192ctx_lr1e-5_bs64_steps-1_20260908_171721
+EVAL_ROOT=/mnt/cpfs/epic-user/zhengruize-20260612/NTP/eval_results
+
+# ---------- 第 1 步：生成（raw 补全 + greedy + pass@1） ----------
+conda activate opmd_eval_cu12
+cd /mnt/cpfs/epic-user/zhengruize-20260612/OPMD/scripts/eval
+
+# base 模型
+python gen_vllm.py \
+    --model_path /mnt/cpfs/epic-user/zhengruize-20260612/OPMD_models/Qwen3-1.7B-Base \
+    --output_dir "$EVAL_ROOT/coding_base" \
+    --tasks HumanEvalPlus,MBPPPlus,LiveCodeBench \
+    --gpu_ids auto --max_model_len 16384 --replace
+
+# 5 个 NTP checkpoint
+for s in 400 800 1200 1600 1902; do
+    python gen_vllm.py \
+        --model_path "$CKPT_ROOT/checkpoint-$s" \
+        --output_dir "$EVAL_ROOT/coding_step_$s" \
+        --tasks HumanEvalPlus,MBPPPlus,LiveCodeBench \
+        --gpu_ids auto --max_model_len 16384 --replace
+done
+
+# ---------- 第 2 步：评分（代码执行） ----------
+conda activate opmd
+cd /mnt/cpfs/epic-user/zhengruize-20260612/OPMD/scripts/eval
+
+for d in coding_base coding_step_400 coding_step_800 coding_step_1200 coding_step_1600 coding_step_1902; do
+    python grade_code.py --input_dir "$EVAL_ROOT/$d" --output_dir "$EVAL_ROOT/$d"
+done
+
+# ---------- 说明 ----------
+# - coding 任务在 gen_vllm.py 里已配置：raw 补全（不套 boxed）、temperature=0、n=1。
+# - grade_code.py 输出 grading_summary.json：
+#     HumanEval+ / MBPP+：pass@1 = plus(base+extra tests) 通过率
+#     LiveCodeBench    ：pass@1 = private 测试通过率（另附 public）
+# - 依次对 base + 5 个 checkpoint 跑「生成 + 评分」；结果收集后画训练曲线。
+# ============================================================
+
+
+
+
+
+
+# ============================================================
+# NTP 训练（Llama-3.2-3B, StarCoderData coding）—— 与 Qwen3-1.7B coding NTP 同参对照
+# 脚本: NTP/submit_ntp_llama3.2_3b_StarCoderData.sh（已写好）
+# ============================================================
+
+# ---------- 激活环境并进入目录 ----------
+conda activate opmd
+cd /mnt/cpfs/epic-user/zhengruize-20260612/NTP
+
+# ---------- 第 1 步：用 Llama-3.2-3B tokenizer 预处理同一份 coding corpus ----------
+export TMPDIR=/dev/shm/zhengruize-20260612/tmp
+mkdir -p "$TMPDIR"
+export TOKENIZERS_PARALLELISM=false
+
+python preprocess_data.py \
+    --model_name_or_path /mnt/cpfs/epic-user/zhengruize-20260612/OPMD_models/Llama-3.2-3B \
+    --data_path /mnt/cpfs/epic-user/zhengruize-20260612/OPMD/datasets/coding_1b/train.jsonl \
+    --output_dir processed_data/StarCoderData_1B_llama3.2_3b \
+    --max_seq_length 8192 \
+    --preprocessing_num_workers 4 \
+    --overwrite_cache
+
+# ---------- 第 2 步：训练 ----------
+bash submit_ntp_llama3.2_3b_StarCoderData.sh
+# 或用 Slurm 提交:
+sbatch submit_ntp_llama3.2_3b_StarCoderData.sh
+
+# ---------- 续训（从已有 checkpoint 恢复） ----------
+OUTPUT_DIR=checkpoints/<已有目录名> bash submit_ntp_llama3.2_3b_StarCoderData.sh
+
+# ============================================================
+# 说明：
+# - 复用同一份 frozen corpus (OPMD/datasets/coding_1b/train.jsonl)，文档与顺序不变，
+#   仅 tokenizer 换成 Llama-3.2-3B；"1B tokens" 是按 Qwen tokenizer 算的，换 Llama 后 token 数略不同。
+# - 超参与 Qwen coding NTP 完全一致：seq 8192 / per-device-bs 2 / grad-accum 8 /
+#   4 卡总 batch 64 / lr 1e-5 / cosine / warmup 0.03 / wd 0.01 / bf16 / 1 epoch / ZeRO-2。
+# - checkpoint 每 400 步保存，目录：
+#   NTP/checkpoints/ntp_llama3.2_3b_StarCoderData_8192ctx_lr1e-5_bs<B>_steps-1_<时间戳>/
+# - Llama-3.2-3B 约为 1.7B 的 2 倍，同 bs64 下时间/显存更高（MegaMath llama 约 12.8h 参考，qwen 约 9.2h）。
+# - 训完用同一套 gen_vllm.py + grade_code.py 在 coding 四个 benchmark 上做 base + 各 checkpoint 评测。
+# ============================================================
+
+
+
+
+
+# ============================================================
+# OPMD 训练（Qwen3-1.7B-Base + coding 语料 StarCoderData）—— 与 math OPMD 同流程
+# student=Qwen3-1.7B-Base（opmd_train.sh 写死），teacher=qwen3-14b-base（默认）
+# ============================================================
+
+# ---------- 数据准备（opmd 环境） ----------
+conda activate opmd
+cd /mnt/cpfs/epic-user/zhengruize-20260612
+
+# 跑 coding 前先备份 math 的熵值缓存，避免 doc_*.pt 同名冲突（mv 改名，不删除）
+mv OPMD/datasets/entropy_cache OPMD/datasets/entropy_cache_math
+
+# 第 1 步：代理模型(DeepSeek-R1-Distill-Qwen-1.5B)在 coding 语料上算逐 token 熵，选 top-5% 高熵 anchor
+python OPMD/scripts/preprocess/anchor_selection.py \
+    --dataset_path OPMD/datasets/coding_1b/train.jsonl \
+    --output_path OPMD/datasets/coding_1b_anchors_0.05.parquet \
+    --anchor_ratio 0.05 \
+    --num_gpus 6
+
+# 第 2 步：把 anchor parquet 转成 verl 训练 parquet
+python OPMD/scripts/preprocess/prepare_opmd_data.py \
+    --anchor_parquet OPMD/datasets/coding_1b_anchors_0.05.parquet \
+    --output_path OPMD/datasets/coding_opmd_0.05_train.parquet \
+    --tokenizer_path OPMD_models/Qwen3-1.7B-Base \
+    --data_source_label coding
+
+# ---------- 训练（opmd_train_cu12 环境） ----------
+conda activate opmd_train_cu12
+cd /mnt/cpfs/epic-user/zhengruize-20260612
+
+TRAIN_DATASET=OPMD/datasets/coding_opmd_0.05_train.parquet \
+TRAIN_DATASET_NAME=StarCoderData-OPMD-0.05 \
+bash OPMD/opmd_train.sh
+
+# 断点续传（若中断）
+RESUME_CKPT=OPMD/checkpoints/<已有目录> \
+TRAIN_DATASET=OPMD/datasets/coding_opmd_0.05_train.parquet \
+TRAIN_DATASET_NAME=StarCoderData-OPMD-0.05 \
+bash OPMD/opmd_train.sh
+
+# ============================================================
+# 说明：
+# - anchor_selection 是最慢的一步（1.5B 代理模型扫 1B tokens，多卡约数小时），支持 --resume 断点续。
+# - --anchor_ratio 0.05 = 直接选 top-5%，等价于 math 高熵臂的 0.15 再 re_screen 到 0.05，更简单。
+# - 超参与 math 一致：lr 1e-6 / mbs 64 / response 512 / temp 1.0 / topk 16 / only_stu /
+#   rw=teacher_p / KL 开启 / 1 epoch。
+# - 想做 low / rand 臂时，先跑 select_anchor_variants.py（从 entropy_cache 重筛），再重复第 2 步 + 训练。
+# - checkpoint 目录由 TRAIN_DATASET_NAME 区分，形如：
+#   OPMD/checkpoints/opmd_StarCoderData-OPMD-0.05_Qwen3-1.7B-Base_qwen3-14b-base_512-T_1.0-n_1-mbs_64-topk_16-only_stu-rw_teacher_p-<时间戳>/
+# ============================================================# 
+
+
+
+
+
+============================================================
+# OPMD coding —— rand 臂（随机 anchor，跳过代理模型熵计算）
+# 脚本: OPMD/scripts/preprocess/select_random_anchors.py（已写好）
+# ============================================================
+
+# ---------- 第 1 步：随机抽取 anchor（无需代理模型，快） ----------
+conda activate opmd
+cd /mnt/cpfs/epic-user/zhengruize-20260612
+
+python OPMD/scripts/preprocess/select_random_anchors.py \
+    --dataset_path OPMD/datasets/coding_1b/train.jsonl \
+    --output_path OPMD/datasets/coding_1b_anchors_rand_0.05.parquet \
+    --tokenizer_path OPMD_models/Qwen3-1.7B-Base \
+    --anchor_ratio 0.05 --seed 42
+
+# ---------- 第 2 步：转 verl 训练 parquet ----------
+python OPMD/scripts/preprocess/prepare_opmd_data.py \
+    --anchor_parquet OPMD/datasets/coding_1b_anchors_rand_0.05.parquet \
+    --output_path OPMD/datasets/coding_opmd_rand_0.05_train.parquet \
+    --tokenizer_path OPMD_models/Qwen3-1.7B-Base \
+    --data_source_label coding
+
+# ---------- 第 3 步：训练 ----------
+conda activate opmd_train_cu12
+cd /mnt/cpfs/epic-user/zhengruize-20260612
+
+TRAIN_DATASET=/mnt/cpfs/epic-user/zhengruize-20260612/OPMD/datasets/coding_opmd_rand_0.05_train.parquet \
+TRAIN_DATASET_NAME=StarCoderData-OPMD-rand-0.05 \
+bash OPMD/opmd_train.sh
+
+# 断点续传
+RESUME_CKPT=OPMD/checkpoints/<已有目录> \
+TRAIN_DATASET=/mnt/cpfs/epic-user/zhengruize-20260612/OPMD/datasets/coding_opmd_rand_0.05_train.parquet \
+TRAIN_DATASET_NAME=StarCoderData-OPMD-rand-0.05 \
+bash OPMD/opmd_train.sh
+
+# ============================================================
+# 说明：
+# - 随机 anchor 用 student tokenizer 直接随机抽位置，entropy 填 0，无需代理模型熵计算。
+# - anchor_position 即 student tokenizer 的 token 下标，与 prepare_opmd_data.py 一致，无 tokenizer 错位。
+# - 其余超参与 math 一致：lr 1e-6 / mbs 64 / response 512 / temp 1.0 / topk 16 / only_stu /
+#   rw=teacher_p / KL 开启 / 1 epoch。
+# - checkpoint 目录形如：
+#   OPMD/checkpoints/opmd_StarCoderData-OPMD-rand-0.05_Qwen3-1.7B-Base_qwen3-14b-base_512-T_1.0-n_1-mbs_64-topk_16-only_stu-rw_teacher_p-<时间戳>/
+# ============================================================# ============================================================
+# 【补充】rand 臂第 2 步精简训练数据：把去重窗口调到 2048
+# 目的：默认 dedup_window=512 会产生约 154 万样本（训练步数约 math 的 3.5 倍），
+#       调成 2048 后样本降到约 40 万，和 math 的 43.5 万一个量级，训练时间回到 math 水平。
+# ============================================================
+
+# 重跑第 2 步（覆盖原训练 parquet，或自行改 output_path 另存）
+conda activate opmd
+cd /mnt/cpfs/epic-user/zhengruize-20260612
+
+python OPMD/scripts/preprocess/prepare_opmd_data.py \
+    --anchor_parquet OPMD/datasets/coding_1b_anchors_rand_0.05.parquet \
+    --output_path OPMD/datasets/coding_opmd_rand_0.05_train.parquet \
+    --tokenizer_path OPMD_models/Qwen3-1.7B-Base \
+    --data_source_label coding \
+    --dedup_window 2048
+
+# 说明：--dedup_window 越大，每个文档保留的 anchor 越稀疏，样本越少、越多样。
+#       dedup_window=512 -> 约 154 万样本；dedup_window=2048 -> 约 40 万样本。
+# ============================================================#
+
+
+
+
+
+
+
+ ============================================================
+# OPMD coding rand 臂训练（数据已筛：dedup_window=2048 → 400,421 样本 ≈ 40 万）
+# 环境: opmd_train_cu12
+# ============================================================
+
+# 激活环境
+conda activate opmd_train_cu12
+cd /mnt/cpfs/epic-user/zhengruize-20260612
+
+# 从头训练
+TRAIN_DATASET=/mnt/cpfs/epic-user/zhengruize-20260612/OPMD/datasets/coding_opmd_rand_0.05_train.parquet \
+TRAIN_DATASET_NAME=StarCoderData-OPMD-rand-0.05 \
+bash OPMD/opmd_train.sh
+
+# 断点续传（若中断）
+RESUME_CKPT=/mnt/cpfs/epic-user/zhengruize-20260612/OPMD/checkpoints/opmd_StarCoderData-OPMD-rand-0.05_Qwen3-1.7B-Base_qwen3-14b-base_512-T_1.0-n_1-mbs_64-topk_16-only_stu-rw_teacher_p-2026-09-12_12-15-28 \
+TRAIN_DATASET=/mnt/cpfs/epic-user/zhengruize-20260612/OPMD/datasets/coding_opmd_rand_0.05_train.parquet \
+TRAIN_DATASET_NAME=StarCoderData-OPMD-rand-0.05 \
+bash OPMD/opmd_train.sh
+
+# 说明：
+# - checkpoint 目录形如：
+#   OPMD/checkpoints/opmd_StarCoderData-OPMD-rand-0.05_Qwen3-1.7B-Base_qwen3-14b-base_512-T_1.0-n_1-mbs_64-topk_16-only_stu-rw_teacher_p-<时间戳>/
+# - 建议用 tmux/nohup 包裹，避免断连中断（见上文 tmux 套路）。
+# ============================================================
+
+
+
+
+
+
+
+
+# ============================================================
+# OPMD scaling-law: teacher=qwen3-30b-a3b-base -> student=qwen3-8b-base, ARM=rand
+# 训练环境: opmd_train_cu12 (vllm 0.19.1 + torch 2.10.0+cu128)
+# 注意: 必须在 GPU 分配好的 shell (CUDA_VISIBLE_DEVICES=UUID) 里运行
+# ============================================================
+
+conda activate opmd_train_cu12
+cd /mnt/cpfs/epic-user/zhengruize-20260612
+STUDENT_MODEL=qwen3-8b-base TEACHER_MODEL=qwen3-30b-a3b-base ARM=rand bash OPMD/opmd_train.sh
+
+
+
+
+
+
+
+
+
+
+# ============================================================
+# OPMD scaling-law 评测：teacher=qwen3-30b-a3b-base -> student=qwen3-8b-base (ARM=rand)
+# 脚本: OPMD/scripts/eval/eval_qwen3_8b_opmd.sh（已写好，自动发现全部 step）
+# 环境: opmd_eval_cu12；每个 step 跑 MATH-500 + Minerva
+# 输出: OPMD/eval_results/opmd_qwen3_8b_megamath_30b_a3b_rand/
+#   step_{step}_math500_minerva/grading_summary.json
+#   all_steps_summary.csv / .txt（全部 step 汇总）
+# ============================================================
+
+# 激活评测环境
+conda activate opmd_eval_cu12
+
+# 1) 全量：自动评测该 run 下全部 checkpoint (global_step_100..1000，共 10 个)
+bash /mnt/cpfs/epic-user/zhengruize-20260612/OPMD/scripts/eval/eval_qwen3_8b_opmd.sh
+
+# 2) 只评测试点 step（recommended 先验证脚本可用性）
+EVAL_STEPS=100,500,1000 bash /mnt/cpfs/epic-user/zhengruize-20260612/OPMD/scripts/eval/eval_qwen3_8b_opmd.sh
+
+# 3) 显式锁 4 卡（Qwen3-8B 有 32 heads，TP_SIZE 必须整除 32；默认 auto 自动选）
+GPU_IDS=0,1,2,3 bash /mnt/cpfs/epic-user/zhengruize-20260612/OPMD/scripts/eval/eval_qwen3_8b_opmd.sh
+
+# 4) 已合并过时跳过合并 + 断点续传生成（中断后继续）
+SKIP_MERGE=1 RESUME=1 bash /mnt/cpfs/epic-user/zhengruize-20260612/OPMD/scripts/eval/eval_qwen3_8b_opmd.sh
+
+# Slurm 交互式运行（在 GPU 分配好的 shell 里）
+srun -p TEST1 -N 1 --gres=gpu:4 --cpus-per-task=32 --time=16:00:00 \
+  bash /mnt/cpfs/epic-user/zhengruize-20260612/OPMD/scripts/eval/eval_qwen3_8b_opmd.sh
+
+
+
+
+
+
+
+
+
+
+  # ============================================================
+# 更新：8b-opmd 评测默认改为每题 4 次 rollout（n=4）
+# 脚本: OPMD/scripts/eval/eval_qwen3_8b_opmd.sh（已加 N_RESPONSES 开关）
+# gen_vllm.py 已加 --n_responses 覆盖参数（不传时仍默认 16，不影响其它评测）
+# ============================================================
+
+conda activate opmd_eval_cu12
+
+# 默认：每题 4 次 rollout，自动跑全部 10 个 checkpoint
+bash /mnt/cpfs/epic-user/zhengruize-20260612/OPMD/scripts/eval/eval_qwen3_8b_opmd.sh
+
+# 若想改回标准 16-rollout 评测
+N_RESPONSES=16 bash /mnt/cpfs/epic-user/zhengruize-20260612/OPMD/scripts/eval/eval_qwen3_8b_opmd.sh
+
+# 试点：只跑 1 个 step（n=4）
+EVAL_STEPS=100 bash /mnt/cpfs/epic-user/zhengruize-20260612/OPMD/scripts/eval/eval_qwen3_8b_opmd.sh
+
+
+
+
+
+
+
+
+
+
+# ============================================================
+# NTP 训练（Qwen3-8B-Base, MegaMath-Web-Pro 1B）—— 8B NTP baseline，供 8B-OPMD 对照
+# 脚本: NTP/submit_ntp_qwen3_8b_megamath.sh（超参默认与 1.7b NTP 训练一致）
+# 环境: opmd（deepspeed 0.19.2 + transformers 4.57.6；实际按你的训练环境决定）
+# ============================================================
+
+conda activate opmd
+cd /mnt/cpfs/epic-user/zhengruize-20260612/NTP
+
+# 第 1 步：用 Qwen3-8B tokenizer 预处理 1B tokens（首次必须）
+export TMPDIR=/dev/shm/zhengruize-20260612/tmp
+mkdir -p "$TMPDIR"
+export TOKENIZERS_PARALLELISM=false
+
+python preprocess_data.py \
+    --model_name_or_path /mnt/cpfs/epic-user/zhengruize-20260612/OPMD_models/Qwen3-8B-Base \
+    --data_path /mnt/cpfs/epic-user/zhengruize-20260612/OPMD/datasets/megamath_web_pro_1B.jsonl \
+    --output_dir processed_data/megamath_web_pro_1B_qwen3_8b \
+    --max_seq_length 8192 \
+    --preprocessing_num_workers 8
+
+# 第 2 步：训练
+# 超参与 1.7b NTP 一致：lr=1e-5 / seq=8192 / grad-accum=8 / cosine / warmup=0.03 / wd=0.01 / ZeRO-2 / 8卡
+# per_device_bs 默认 1（4 卡 bs=2 + seq8192 实测 OOM）
+
+# 方式 A：Slurm 提交（脚本自带 #SBATCH 头，8 卡）
+sbatch submit_ntp_qwen3_8b_megamath.sh
+
+# 方式 B：已分配 GPU 的 shell 直接跑
+bash submit_ntp_qwen3_8b_megamath.sh
+
+# 续训
+OUTPUT_DIR=checkpoints/<已有目录名> bash submit_ntp_qwen3_8b_megamath.sh
+# ============================================================
+# Qwen3-8B-Base 基线评测（MATH-500 + Minerva，n=4）
+
+
+# 脚本: OPMD/scripts/eval/eval_qwen3_8b_base.sh（已写好，直接加载 HF 模型，无需 merge）
+# ============================================================
+
+conda activate opmd_eval_cu12
+
+# 默认：每题 4 次 rollout，输出到 OPMD/eval_results/qwen3_8b_base/
+bash /mnt/cpfs/epic-user/zhengruize-20260612/OPMD/scripts/eval/eval_qwen3_8b_base.sh
+
+# 若要 16-rollout
+N_RESPONSES=16 bash /mnt/cpfs/epic-user/zhengruize-20260612/OPMD/scripts/eval/eval_qwen3_8b_base.sh
+
+# 显式锁 4 卡（Qwen3-8B 有 32 heads，TP_SIZE 必须整除 32）
+GPU_IDS=0,1,2,3 bash /mnt/cpfs/epic-user/zhengruize-20260612/OPMD/scripts/eval/eval_qwen3_8b_base.sh
+
+# ============================================================
+# Qwen3-30B-A3B-Base 基线评测（MATH-500 + Minerva，n=4）
+# 脚本: OPMD/scripts/eval/eval_qwen3_30b_a3b_base.sh（已写好，直接加载 HF 模型，无需 merge）
+# 模型为 MoE：128 experts / 8 experts per token / 激活约 3B
+# ============================================================
+
+conda activate opmd_eval_cu12
+
+# 默认：每题 4 次 rollout，输出到 OPMD/eval_results/qwen3_30b_a3b_base/
+bash /mnt/cpfs/epic-user/zhengruize-20260612/OPMD/scripts/eval/eval_qwen3_30b_a3b_base.sh
+
+# 若要 16-rollout
+N_RESPONSES=16 bash /mnt/cpfs/epic-user/zhengruize-20260612/OPMD/scripts/eval/eval_qwen3_30b_a3b_base.sh
+
+# 显式锁 4 卡（有 32 heads，TP_SIZE 必须整除 32）
+GPU_IDS=0,1,2,3 bash /mnt/cpfs/epic-user/zhengruize-20260612/OPMD/scripts/eval/eval_qwen3_30b_a3b_base.sh
+
+
+
+
+# ============================================================
+# Coding OPMD (14b→1.7b, StarCoderData-rand-0.05) —— 100 step checkpoint 评测
+# 脚本: OPMD/scripts/eval/eval_qwen3_1.7b_coding_opmd.sh（已写好）
+# base 模型(1.7b) 已评测过、无需重跑，结果在:
+#   NTP/eval_results/coding_base/grading_summary.json
+#   HumanEvalPlus plus_pass@1=33.5%  MBPPPlus plus_pass@1=54.2%  LiveCodeBench private=1.7%
+# ============================================================
+
+# 评测 100 step checkpoint（merge -> vLLM 生成 -> 代码执行评分）
+bash /mnt/cpfs/epic-user/zhengruize-20260612/OPMD/scripts/eval/eval_qwen3_1.7b_coding_opmd.sh
+
+# 结果: OPMD/eval_results/coding_opmd_qwen3_1.7b/step_100_coding/grading_summary.json
+# 对比上面 base 的三个 pass@1，判断是否有提升。
+
+
+
+
+
+# ============================================================
+# Coding OPMD (14b→1.7b) —— 清洗 metadata + 完整 prefix 后的最终训练集
+# 数据: coding_opmd_rand_0.05_train_final.parquet (261,008 样本，全部 1024-token 完整 prefix)
+# 清洗: 去掉 <reponame>/<filename>/<gh_stars> 等 metadata 标记，并过滤 context_length<1024 的样本
+# ============================================================
+
+conda activate opmd_train_cu12
+cd /mnt/cpfs/epic-user/zhengruize-20260612
+
+TRAIN_DATASET=/mnt/cpfs/epic-user/zhengruize-20260612/OPMD/datasets/coding_opmd_rand_0.05_train_final.parquet \
+TRAIN_DATASET_NAME=StarCoderData-OPMD-rand-0.05-final \
+bash OPMD/opmd_train.sh
+
+
+
+
+
+
+
+# ============================================================
+# Coding OPMD (14b→1.7b) —— 纯 Python、高熵 anchor 训练集
+# 数据: coding_opmd_python_0.05_train.parquet (161,415 样本，anchor 为 top-5% 高熵)
+# ============================================================
+
+conda activate opmd_train_cu12
+cd /mnt/cpfs/epic-user/zhengruize-20260612
+
+TRAIN_DATASET=/mnt/cpfs/epic-user/zhengruize-20260612/OPMD/datasets/coding_opmd_python_0.05_train.parquet \
+TRAIN_DATASET_NAME=StarCoderData-OPMD-python-0.05 \
+bash OPMD/opmd_train.sh# 
+
+
+
+
+
+
+
+
+============================================================
+# Math OPMD (14b→1.7b) —— 补充评测未评测的 checkpoint（n=16）
+# 脚本: OPMD/scripts/eval/eval_qwen3_1.7b_opmd.sh（已改为三臂 + ARMS_ENV 覆盖）
+# ============================================================
+
+# 命令 1：high + rand（step 100/300/500/700/900/1100）
+ARMS_ENV="teacher|/mnt/cpfs/epic-user/zhengruize-20260612/OPMD/checkpoints/opmd_MegaMath-Web-Pro-OPMD-0.05_Qwen3-1.7B-Base_qwen3-14b-base_512-T_1.0-n_1-mbs_64-topk_16-only_stu-rw_teacher_p-2026-08-10_14-30-53,teacher_rand|/mnt/cpfs/epic-user/zhengruize-20260612/OPMD/checkpoints/opmd_MegaMath-Web-Pro-OPMD-rand-0.05_Qwen3-1.7B-Base_qwen3-14b-base_512-T_1.0-n_1-mbs_64-topk_16-only_stu-rw_teacher_p-2026-08-24_18-13-45" \
+EVAL_STEPS=100,300,500,700,900,1100 \
+bash /mnt/cpfs/epic-user/zhengruize-20260612/OPMD/scripts/eval/eval_qwen3_1.7b_opmd.sh
+
+# 命令 2：low（step 100/200/400/500/700/800/1000/1100/1300/1400/1600）
+ARMS_ENV="teacher_low|/mnt/cpfs/epic-user/zhengruize-20260612/OPMD/checkpoints/opmd_MegaMath-Web-Pro-OPMD-low-0.05_Qwen3-1.7B-Base_qwen3-14b-base_512-T_1.0-n_1-mbs_64-topk_16-only_stu-rw_teacher_p-2026-08-28_01-03-02" \
+EVAL_STEPS=100,200,400,500,700,800,1000,1100,1300,1400,1600 \
+bash /mnt/cpfs/epic-user/zhengruize-20260612/OPMD/scripts/eval/eval_qwen3_1.7b_opmd.sh
+
+
+
+
+# ============================================================
+# Math OPMD (8b→0.6b) —— 训练命令
+# student=Qwen3-0.6B-Base, teacher=Qwen3-8B-Base
+# 已修改 opmd_train.sh 支持 qwen3-0.6b-base
+# ============================================================
+
+conda activate opmd_train_cu12
+cd /mnt/cpfs/epic-user/zhengruize-20260612
+
+STUDENT_MODEL=qwen3-0.6b-base TEACHER_MODEL=qwen3-8b-base ARM=high \
+bash OPMD/opmd_train.sh
+
+
+
+
+
+
+
+
+
+# ============================================================
+# Math OPMD (8b→0.6b) —— 评测命令（n=16）
+# student=Qwen3-0.6B-Base, teacher=Qwen3-8B-Base
+# 脚本: 已仿照 8b 版新建 OPMD/scripts/eval/eval_qwen3_0.6b_base.sh / eval_qwen3_0.6b_opmd.sh
+# 说明: Qwen3-0.6B 有 16 heads，TP_SIZE 必须整除 16（gen_vllm.py 自动选）
+# ============================================================
+
+# 命令 1：0.6B BASE（HF 直接加载，无需合并；MATH-500 + Minerva，n=16）
+bash OPMD/scripts/eval/eval_qwen3_0.6b_base.sh
+
+# 命令 2：0.6B OPMD 100 步 checkpoint（合并 FSDP + vLLM 推理 + 规则评分；n=16）
+# 默认自动发现全部 global_step_*（当前仅 step 100）
+bash OPMD/scripts/eval/eval_qwen3_0.6b_opmd.sh
+
+# 只评测试点 step（等价于上面，因为只有 100 这一个 checkpoint）
+EVAL_STEPS=100 bash OPMD/scripts/eval/eval_qwen3_0.6b_opmd.sh
+
+# 结果位置：
+#   base: OPMD/eval_results/qwen3_0.6b_base/grading_summary.json
+#   opmd: OPMD/eval_results/opmd_qwen3_0.6b_megamath_8b_teacher/step_100_math500_minerva/grading_summary.json
+#         OPMD/eval_results/opmd_qwen3_0.6b_megamath_8b_teacher/all_steps_summary.csv / .txt
+# ============================================================# 
+
+
+
+
+
+
+============================================================
+# Math OPMD (4b→1.7b) —— 训练命令
+# student=Qwen3-1.7B-Base, teacher=Qwen3-4B-Base
+# 数据集: 与 14b 主实验一致的 high-entropy 臂 = megamath_web_pro_opmd_0.05_train.parquet（ARM=high）
+# 说明: 已修正 OPMD/opmd_train.sh 里 qwen3-4b-base 的教师路径 → OPMD_models/Qwen3-4B-Base
+# ============================================================
+
+conda activate opmd_train_cu12
+cd /mnt/cpfs/epic-user/zhengruize-20260612
+
+STUDENT_MODEL=qwen3-1.7b-base TEACHER_MODEL=qwen3-4b-base ARM=high \
+bash OPMD/opmd_train.sh
+
+# 断点续传（若中断）
+# RESUME_CKPT=OPMD/checkpoints/<已有目录> \
+# STUDENT_MODEL=qwen3-1.7b-base TEACHER_MODEL=qwen3-4b-base ARM=high \
+# bash OPMD/opmd_train.sh
+
+# 说明：与 14b→1.7b 主实验唯一变量是 teacher（14b→4b）；
+#       数据集、GPU 数（按当前平台分配）、其余超参一致。checkpoint 目录形如：
+#   OPMD/checkpoints/opmd_MegaMath-Web-Pro-OPMD-0.05_Qwen3-1.7B-Base_qwen3-4b-base_512-T_1.0-n_1-mbs_64-topk_16-only_stu-rw_teacher_p-<时间戳>/
+# ============================================================

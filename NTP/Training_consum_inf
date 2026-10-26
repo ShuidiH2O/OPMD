@@ -1,0 +1,63 @@
+NTP Phase 1 — Training Consumption & Efficiency Report
+========================================================
+Generated: 2026-06-23
+
+Job: ntp_qwen3_4b_megamath_8192ctx_lr2e-5_bs96_steps-1_20260622_124935
+
+--- Hardware ---
+GPU Type:        NVIDIA A800 80GB
+GPU Count:       6
+DeepSpeed:       ZeRO-2
+Precision:       bf16 (with tf32 enabled)
+Flash Attention: No (use_flash_attn false)
+
+--- Model ---
+Architecture:    Qwen3ForCausalLM
+Base Model:      qwen3-4b-base
+Parameters:      ~4B (36 layers, hidden=2560, head=32, kv_head=8)
+Vocab Size:      151936
+
+--- Data ---
+Dataset:         MegaMath + FineWeb Mixture
+Total Tokens:    1.25B
+Max Seq Length:  8192
+Preprocessed:    Yes (Arrow format)
+
+--- Hyperparameters ---
+Learning Rate:         2e-5
+LR Scheduler:          cosine
+Warmup Ratio:          0.03 (warmup steps ≈ 48)
+Weight Decay:          0.01
+Total Batch Size:      96 (2 per_device × 8 grad_accum × 6 GPUs)
+Effective Tokens/Batch:≈ 786K (96 × 8192)
+Max Steps:             -1 (run full epoch)
+Epochs:                1
+Gradient Checkpointing:Yes
+
+--- Time & Efficiency ---
+Start Time:            2026-06-22 12:49:35 UTC
+End Time:              2026-06-23 04:52:00 UTC
+Total Wall Time:       16:00:34 (57634 seconds)
+Total Steps:           1585
+Steps per Second:      0.028 (≈ 36.4 s/step)
+Samples per Second:    2.639
+
+--- Total Compute ---
+Total FLOPs:           2.716 × 10^19 (≈ 27.16 EFLOPS)
+GPU-Hours:             96.1 GPU-hours (6 GPUs × 16.01 hours)
+
+--- Loss ---
+Final Train Loss:      1.0707
+Loss Trend:            Start ~1.12 → End ~1.04 (steady decline)
+Min Loss (step ~455):  0.9941
+
+--- Checkpoints ---
+Saved every 200 steps.
+Final model: NTP/checkpoints/ntp_qwen3_4b_megamath_8192ctx_lr2e-5_bs96_steps-1_20260622_124935/
+
+--- Estimated 8-GPU Projection ---
+If run on 8 GPUs with same per-device batch size (2) and grad_accum (8):
+  Total Batch Size: 128 (2 × 8 × 8)
+  Estimated Steps:  ~1189 (1 epoch, linear scaling)
+  Estimated Time:   ~11.8 hours (assuming linear GPU scaling)
+  GPU-Hours:        ~94.4 GPU-hours
